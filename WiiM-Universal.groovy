@@ -16,6 +16,7 @@
  *  Based on WiiM/LinkPlay HTTP API documentation and Home Assistant integration
  *
  *  Change Log:
+ *  Version 1.10 - 2025-06-26 - Refactored album art handling: removed unsupported getCoverArt logic, added support for both track/album art and station art using art, albumArtURI, and picurl fields. Added new attributes for trackArtUrl, trackArtHtml, stationArtUrl, and stationArtHtml. Updated albumArt/albumArtHtml to always reflect the best available art. Improved calls to getMetaInfo and getPresetInfo for robust artwork support.
  *  Version 1.09 - 2025-06-25 - Removed TuneIn, iHeartRadio, and Spotify functionality to rely on presets
  *  Version 1.08 - 2025-06-24 - Fixed BigDecimal modulo error in formatTime function, added better error handling
  *                               for track position/duration, handle live streams with totlen=0
@@ -71,6 +72,10 @@ metadata {
         attribute "multiroomRole", "enum", ["standalone", "master", "slave"]
         attribute "multiroomSlaves", "number"
         attribute "availableSources", "string"
+        attribute "trackArtUrl", "string"
+        attribute "trackArtHtml", "string"
+        attribute "stationArtUrl", "string"
+        attribute "stationArtHtml", "string"
         
         command "playPreset", ["number"]
         command "switchToSource", ["string"]
@@ -155,6 +160,8 @@ def getDeviceInfo() {
 def getStatus() {
     logDebug "Getting playback status"
     sendCommand("getPlayerStatus")
+    sendCommand("getMetaInfo")
+    sendCommand("getPresetInfo")
 }
 
 def play() {
@@ -416,6 +423,10 @@ def parseResponse(command, data) {
                 parseMultiroomStatus(json)
             } else if (command == "getLocalPlayList") {
                 parseUSBPlaylist(json)
+            } else if (command == "getMetaInfo") {
+                parseMetaInfo(json)
+            } else if (command == "getPresetInfo") {
+                parsePresetInfo(json)
             }
         } else if (data.toString().isNumber()) {
             // Handle simple numeric responses like GetTrackNumber
@@ -554,6 +565,35 @@ def parsePlayerStatus(json) {
         }
         sendEvent(name: "multiroomRole", value: role)
     }
+    
+    // Try to get the best available artwork
+    // Priority: art (track), albumArtURI (track/station), picurl (station)
+    def trackArt = null
+    if (json.art) {
+        trackArt = hexToAscii(json.art) ?: json.art
+    }
+    // We'll get albumArtURI from getMetaInfo if available (see below)
+    // Fallback to station art from preset info if needed
+
+    def bestArt = trackArt
+    if (!bestArt && state.albumArtURI) {
+        bestArt = state.albumArtURI
+    }
+    if (!bestArt && state.stationPicUrl) {
+        bestArt = state.stationPicUrl
+    }
+
+    sendEvent(name: "trackArtUrl", value: trackArt ?: "")
+    updateTrackArtHtml(trackArt)
+    updateBestAlbumArt()
+
+    sendEvent(name: "stationArtUrl", value: state.stationPicUrl ?: "")
+    updateStationArtHtml(state.stationPicUrl)
+    updateBestAlbumArt()
+
+    // For compatibility, set albumArt/albumArtHtml to the best available
+    sendEvent(name: "albumArt", value: bestArt ?: "")
+    updateAlbumArtHtml(bestArt)
 }
 
 def parseDeviceStatus(json) {
@@ -622,6 +662,27 @@ def parseUSBPlaylist(json) {
     }
 }
 
+def parseMetaInfo(json) {
+    if (json.metaData?.albumArtURI) {
+        def albumArtURI = json.metaData.albumArtURI
+        state.albumArtURI = albumArtURI
+        sendEvent(name: "trackArtUrl", value: albumArtURI)
+        updateTrackArtHtml(albumArtURI)
+        updateBestAlbumArt()
+    }
+}
+
+def parsePresetInfo(json) {
+    if (json.preset_list && json.preset_list.size() > 0) {
+        // For now, just use the first preset as the current station
+        def picurl = json.preset_list[0]?.picurl
+        state.stationPicUrl = picurl
+        sendEvent(name: "stationArtUrl", value: picurl ?: "")
+        updateStationArtHtml(picurl)
+        updateBestAlbumArt()
+    }
+}
+
 def updateAlbumArtHtml(artUrl) {
     if (!artUrl || artUrl == "") {
         sendEvent(name: "albumArtHtml", value: "<div style='text-align: center; color: #666;'>No album art available</div>")
@@ -644,6 +705,40 @@ def updateAlbumArtHtml(artUrl) {
     """
     
     sendEvent(name: "albumArtHtml", value: htmlContent)
+}
+
+def updateTrackArtHtml(artUrl) {
+    if (!artUrl) {
+        sendEvent(name: "trackArtHtml", value: "<div style='text-align: center; color: #666;'>No track art available</div>")
+        return
+    }
+    def size = albumArtSize ?: "150"
+    def currentTrack = device.currentValue("currentTrack") ?: "Unknown Track"
+    def currentArtist = device.currentValue("currentArtist") ?: "Unknown Artist"
+    def htmlContent = """
+    <div style='text-align: center; padding: 10px; background: #f8f9fa; border-radius: 8px; margin: 5px;'>
+        <img src='${artUrl}' style='width: ${size}px; height: ${size}px; object-fit: cover; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);' onerror='this.style.display=\"none\"' alt='Track Art'/>
+        <div style='margin-top: 8px; font-size: 14px; font-weight: bold; color: #333;'>${currentTrack}</div>
+        <div style='font-size: 12px; color: #666; margin-top: 2px;'>${currentArtist}</div>
+    </div>
+    """
+    sendEvent(name: "trackArtHtml", value: htmlContent)
+}
+
+def updateStationArtHtml(artUrl) {
+    if (!artUrl) {
+        sendEvent(name: "stationArtHtml", value: "<div style='text-align: center; color: #666;'>No station art available</div>")
+        return
+    }
+    def size = albumArtSize ?: "150"
+    def currentStation = device.currentValue("currentSource") ?: "Unknown Station"
+    def htmlContent = """
+    <div style='text-align: center; padding: 10px; background: #f8f9fa; border-radius: 8px; margin: 5px;'>
+        <img src='${artUrl}' style='width: ${size}px; height: ${size}px; object-fit: cover; border-radius: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.15);' onerror='this.style.display=\"none\"' alt='Station Art'/>
+        <div style='margin-top: 8px; font-size: 14px; font-weight: bold; color: #333;'>${currentStation}</div>
+    </div>
+    """
+    sendEvent(name: "stationArtHtml", value: htmlContent)
 }
 
 // Logging functions
@@ -697,5 +792,20 @@ def formatTime(milliseconds) {
     } catch (Exception e) {
         logError "Error formatting time for ${milliseconds}ms: ${e.message}"
         return "0:00"
+    }
+}
+
+def updateBestAlbumArt() {
+    def trackArtUrl = device.currentValue("trackArtUrl")
+    def stationArtUrl = device.currentValue("stationArtUrl")
+    def lastAlbumArt = device.currentValue("albumArt")
+    def bestArt = trackArtUrl ?: stationArtUrl
+
+    if (bestArt != lastAlbumArt) {
+        sendEvent(name: "albumArt", value: bestArt ?: "")
+        updateAlbumArtHtml(bestArt)
+        logDebug "albumArt updated to: ${bestArt} (trackArtUrl: ${trackArtUrl}, stationArtUrl: ${stationArtUrl})"
+    } else {
+        logDebug "albumArt unchanged. (trackArtUrl: ${trackArtUrl}, stationArtUrl: ${stationArtUrl})"
     }
 }
